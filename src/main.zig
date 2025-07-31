@@ -14,6 +14,7 @@ const Entry = struct {
     timestamp: i64,
     value_pos: u64, // the position (offset) of the value in the data file on disk
     value_size: u32,
+    file_id: u32,
 };
 
 /// KeyDir is an in-memory index mapping keys to their file positions
@@ -39,25 +40,36 @@ const KeyDir = struct {
         self.map.deinit();
     }
 
-    pub fn put(self: *KeyDir, key: []const u8, value: []const u8, timestamp: i64, value_pos: u64, value_size: u32) !void {
+    pub fn put(self: *KeyDir, key: []const u8, value: []const u8, timestamp: i64, value_pos: u64, value_size: u32, file_id: u32) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        // This for ownership and not affect the map with any change in key or value
+    
+        // Create copies of key and value
         const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
         const value_copy = try self.allocator.dupe(u8, value);
-
-        // If key exists, free the old value
-        if (self.map.get(key_copy)) |old_entry| {
-            self.allocator.free(old_entry.value);
+        errdefer self.allocator.free(value_copy);
+    
+        // If key exists, free both the old key and value
+        if (self.map.get(key)) |old_entry| {
+            const old_key = old_entry.key;
+            const old_value = old_entry.value;
+            
+            // Remove from map first
+            _ = self.map.remove(key);
+            
+            // Then free the memory
+            self.allocator.free(old_key);
+            self.allocator.free(old_value);
         }
-
+    
         try self.map.put(key_copy, Entry{
             .key = key_copy,
             .value = value_copy,
             .timestamp = timestamp,
             .value_pos = value_pos,
             .value_size = value_size,
+            .file_id = file_id,
         });
     }
 
@@ -99,6 +111,7 @@ pub const Bitcask = struct {
     keydir: KeyDir,
     allocator: Allocator,
     active_file_size: u64,
+    file_sizes: std.AutoHashMap(u32, u64), // Maps file IDs to their sizes
 
     const EntryHeader = struct {
         crc: u32,
@@ -122,6 +135,14 @@ pub const Bitcask = struct {
         var dir = try fs.cwd().openDir(dir_path, .{ .iterate = true });
         defer dir.close();
 
+        var data_files = ArrayList([]const u8).init(allocator);
+        defer {
+            for (data_files.items) |item| {
+                allocator.free(item);
+            }
+            data_files.deinit();
+        }
+
         var max_file_id: u32 = 0;
         var it = dir.iterate();
         while (try it.next()) |entry| {
@@ -132,6 +153,10 @@ pub const Bitcask = struct {
                 const id_str = entry.name[5..];
                 const id = std.fmt.parseInt(u32, id_str, 10) catch continue;
                 if (id > max_file_id) max_file_id = id;
+
+                // Append file to data files
+                const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                try data_files.append(file_path);
             }
         }
 
@@ -139,7 +164,7 @@ pub const Bitcask = struct {
         const file_path = try std.fmt.allocPrint(allocator, "{s}/data.{d}", .{ dir_path, active_file_id });
         defer allocator.free(file_path);
 
-        // Open active file for writing
+        // Create and Open active file for writing
         const active_file = try fs.cwd().createFile(file_path, .{});
 
         const dir_path_copy = try allocator.dupe(u8, dir_path);
@@ -151,10 +176,10 @@ pub const Bitcask = struct {
             .keydir = KeyDir.init(allocator),
             .allocator = allocator,
             .active_file_size = 0,
+            .file_sizes = std.AutoHashMap(u32, u64).init(allocator),
         };
 
-        // Load existing data files
-        try db.loadExistingFiles();
+        try db.loadExistingFiles(data_files);
 
         return db;
     }
@@ -162,37 +187,16 @@ pub const Bitcask = struct {
     pub fn deinit(self: *Bitcask) void {
         self.active_file.close();
         self.keydir.deinit();
+        self.file_sizes.deinit();
         self.allocator.free(self.dir_path);
     }
 
-    fn loadExistingFiles(self: *Bitcask) !void {
-        var dir = try fs.cwd().openDir(self.dir_path, .{ .iterate = true });
-        defer dir.close();
-
-        var data_files = ArrayList([]const u8).init(self.allocator);
-        defer {
-            for (data_files.items) |item| {
-                self.allocator.free(item);
-            }
-            data_files.deinit();
-        }
-
-        // Collect all data files
-        var it = dir.iterate();
-        while (try it.next()) |entry| {
-            if (entry.kind != .file) continue;
-
-            if (std.mem.startsWith(u8, entry.name, "data.")) {
-                const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.dir_path, entry.name });
-                try data_files.append(file_path);
-            }
-        }
-
+    fn loadExistingFiles(self: *Bitcask, data_files: ArrayList([]const u8)) !void {
         // Sort files by ID to process them in order
         std.mem.sort([]const u8, data_files.items, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                const a_id = std.fmt.parseInt(u32, std.mem.sliceTo(a[a.len - 10 ..], '.'), 10) catch return false;
-                const b_id = std.fmt.parseInt(u32, std.mem.sliceTo(b[b.len - 10 ..], '.'), 10) catch return false;
+                const a_id = std.fmt.parseInt(u32, std.mem.sliceTo(a[4..], '.'), 10) catch return false;
+                const b_id = std.fmt.parseInt(u32, std.mem.sliceTo(b[4..], '.'), 10) catch return false;
                 return a_id < b_id;
             }
         }.lessThan);
@@ -202,13 +206,19 @@ pub const Bitcask = struct {
             var file = try fs.cwd().openFile(file_path, .{});
             defer file.close();
 
-            try self.loadEntriesFromFile(file);
+            try self.loadEntriesFromFile(file, file_path);
         }
     }
 
-    fn loadEntriesFromFile(self: *Bitcask, file: fs.File) !void {
+    fn loadEntriesFromFile(self: *Bitcask, file: fs.File, file_path: []const u8) !void {
+        // Extract file ID from path
+        const file_name = std.fs.path.basename(file_path);
+        const id_str = file_name[5..]; // Skip "data."
+        const file_id = try std.fmt.parseInt(u32, id_str, 10);
+
         // Increase buffer size to match EntryHeader size
         var buf: [24]u8 = undefined;
+        // Keep track of the position of the file
         var pos: u64 = 0;
 
         while (true) {
@@ -217,6 +227,7 @@ pub const Bitcask = struct {
             const header_bytes = try file.read(buf[0..header_size]);
             if (header_bytes < header_size) break; // EOF
 
+            // Cast header into entry header
             const header = @as(*align(1) EntryHeader, @ptrCast(&buf[0])).*;
             pos += header_size;
 
@@ -237,15 +248,16 @@ pub const Bitcask = struct {
             }
             pos += header.value_size;
 
-            // Update keydir
-            try self.keydir.put(key_buf, value_buf, header.timestamp, pos - header.value_size, header.value_size);
+            try self.keydir.put(key_buf, value_buf, header.timestamp, pos - header.value_size, header.value_size, file_id);
         }
+
+        // Store the file size
+        try self.file_sizes.put(file_id, pos);
     }
 
     pub fn put(self: *Bitcask, key: []const u8, value: []const u8, config: Config) !void {
         const timestamp = time.milliTimestamp();
 
-        // Prepare header
         const header = EntryHeader{
             .crc = 0, // TODO: Implement CRC
             .timestamp = timestamp,
@@ -257,20 +269,18 @@ pub const Bitcask = struct {
         const header_size = @sizeOf(EntryHeader);
         const entry_size = header_size + key.len + value.len;
 
-        // Check if we need to rotate the file
+        // Check if we need to rotate the file (if we have more size to fit)
         if (self.active_file_size + entry_size > config.max_file_size) {
             try self.rotateActiveFile();
         }
 
         // Write header
-        const header_bytes = std.mem.asBytes(&header);
-        _ = try self.active_file.write(header_bytes);
+        _ = try self.active_file.write(std.mem.asBytes(&header));
 
         // Write key
         _ = try self.active_file.write(key);
 
-        // Write value and record position for keydir
-        const value_pos = self.active_file_size + header_size + key.len;
+        // Write value
         _ = try self.active_file.write(value);
 
         // Update file size
@@ -282,10 +292,14 @@ pub const Bitcask = struct {
         }
 
         // Update keydir
-        try self.keydir.put(key, value, timestamp, value_pos, @intCast(value.len));
+        const value_pos = self.active_file_size - value.len;
+        try self.keydir.put(key, value, timestamp, value_pos, @intCast(value.len), self.active_file_id);
     }
 
     fn rotateActiveFile(self: *Bitcask) !void {
+        // Store the size of the current active file
+        try self.file_sizes.put(self.active_file_id, self.active_file_size);
+
         // Close current active file
         try self.active_file.sync();
         self.active_file.close();
@@ -307,8 +321,7 @@ pub const Bitcask = struct {
         const entry = entry_opt.?;
 
         // Open the file containing the value
-        const file_id = try self.getFileIdFromPosition(entry.value_pos);
-        const file_path = try std.fmt.allocPrint(self.allocator, "{s}/data.{d}", .{ self.dir_path, file_id });
+        const file_path = try std.fmt.allocPrint(self.allocator, "{s}/data.{d}", .{ self.dir_path, entry.file_id });
         defer self.allocator.free(file_path);
 
         var file = try fs.cwd().openFile(file_path, .{});
@@ -329,12 +342,20 @@ pub const Bitcask = struct {
         return value_buf;
     }
 
-    fn getFileIdFromPosition(self: *Bitcask, position: u64) !u32 {
-        _ = position; // Unused parameter in this simplified implementation
+    pub fn getFileIdFromPosition(self: *Bitcask, position: u64) !u32 {
+        // Iterate through all files to find which one contains the position
+        var it = self.file_sizes.iterator();
 
-        // This is a simplified implementation
-        // In a real implementation, you'd need to track file sizes to determine which file contains a position
-        // For now, we'll assume it's in the active file
+        while (it.next()) |entry| {
+            const file_id = entry.key_ptr.*;
+            const file_size = entry.value_ptr.*;
+
+            if (position < file_size) {
+                return file_id;
+            }
+        }
+
+        // If we couldn't find the file, return the active file ID as a fallback
         return self.active_file_id;
     }
 
@@ -437,6 +458,7 @@ pub const Bitcask = struct {
         self.active_file.close();
 
         // Replace old files with merged file
+        // TODO: what if one merge file is not enough?
         var dir = try fs.cwd().openDir(self.dir_path, .{ .iterate = true });
         defer dir.close();
 
@@ -462,5 +484,15 @@ pub const Bitcask = struct {
         self.active_file_id = 1;
         self.active_file = try fs.cwd().openFile(new_path, .{ .mode = .read_write });
         self.active_file_size = merge_size;
+
+        // Clear file_sizes and add the new file
+        self.file_sizes.clearRetainingCapacity();
+        try self.file_sizes.put(1, merge_size);
+
+        // Update all entries in keydir to use the new file ID
+        it = self.keydir.map.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.file_id = 1;
+        }
     }
 };

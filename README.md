@@ -67,6 +67,29 @@ pub fn main() !void {
 }
 ```
 
+See the [examples](examples/) directory for more detailed usage examples:
+- [Basic Usage](examples/basic_usage.zig) - Simple key-value operations
+- [Rotation and Compaction](examples/rotation_and_compaction.zig) - File rotation and merge operations
+- [Simple KV Server](examples/simple_kv_server.zig) - A TCP server using Bitcask for storage
+
+## Configuration
+
+Bitcask can be configured with the following options:
+
+```zig
+// Default configuration
+const config = Bitcask.Config{
+    .max_file_size = 1024 * 1024 * 10, // 10MB default
+    .sync_on_put = false, // Whether to sync after each put operation
+};
+
+// Custom configuration
+var db = try Bitcask.init(allocator, "my_database", .{
+    .max_file_size = 1024 * 1024, // 1MB
+    .sync_on_put = true, // Sync after each put for durability
+});
+```
+
 ## Building
 
 ```bash
@@ -86,10 +109,34 @@ zig build test
 - [x] File rotation
 - [x] Merge/compaction
 - [x] List keys
+- [x] Thread-safe operations with mutex protection
 - [ ] CRC checksums for data integrity
 - [ ] Hint files for faster startup
 - [ ] Configurable expiry
 
-## License
+## Development
 
-MIT
+### Building
+
+```bash
+zig build
+```
+
+### Running Tests
+
+```bash
+zig build test
+```
+
+### Formatting Code
+
+```bash
+zig fmt src/ examples/ build.zig
+```
+
+### CI/CD
+
+This project uses GitHub Actions for continuous integration:
+
+- Automated testing on push and pull requests
+- Code formatting checks
